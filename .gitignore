@@ -3,3 +3,4 @@ __pycache__/
 *.py[cod]
 .streamlit/
 data/output/
+src/*.egg-info/

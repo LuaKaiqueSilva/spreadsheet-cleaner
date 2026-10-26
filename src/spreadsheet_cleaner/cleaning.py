@@ -10,6 +10,15 @@ import pandas as pd
 
 
 @dataclass(frozen=True)
+class CleaningOptions:
+    remove_empty_rows: bool = True
+    remove_duplicate_rows: bool = False
+    remove_empty_columns: bool = True
+    trim_whitespace: bool = True
+    normalize_headers: bool = True
+
+
+@dataclass(frozen=True)
 class CleaningResult:
     dataframe: pd.DataFrame
     original_rows: int
@@ -18,6 +27,8 @@ class CleaningResult:
     removed_empty_columns: int
     trimmed_cells: int
     renamed_columns: int
+    removed_rows: pd.DataFrame
+    removed_columns: tuple[str, ...]
 
 
 def normalize_column_name(value: object, position: int) -> str:
@@ -27,40 +38,61 @@ def normalize_column_name(value: object, position: int) -> str:
     return text or f"coluna_{position + 1}"
 
 
-def clean_dataframe(dataframe: pd.DataFrame) -> CleaningResult:
-    """Trim text, normalize headers and remove fully empty and duplicate rows."""
-    frame = dataframe.copy()
+def clean_dataframe(
+    dataframe: pd.DataFrame, options: CleaningOptions | None = None
+) -> CleaningResult:
+    """Clean a table according to the selected operations and retain removed rows for review."""
+    options = options or CleaningOptions()
+    source = dataframe.copy().reset_index(drop=True)
+    frame = source.copy()
     original_rows = len(frame)
     original_columns = list(frame.columns)
 
-    frame = frame.dropna(axis=1, how="all")
+    removed_columns = tuple(
+        str(frame.columns[position])
+        for position in range(len(frame.columns))
+        if frame.iloc[:, position].isna().all()
+    ) if options.remove_empty_columns else ()
+    if options.remove_empty_columns:
+        frame = frame.dropna(axis=1, how="all")
     removed_empty_columns = len(original_columns) - len(frame.columns)
     trimmed_cells = 0
-    for column in frame.columns:
-        if pd.api.types.is_object_dtype(frame[column]) or pd.api.types.is_string_dtype(frame[column]):
-            before = frame[column].copy()
-            frame[column] = frame[column].map(
-                lambda value: value.strip() if isinstance(value, str) else value
-            )
-            trimmed_cells += int(
-                ((before != frame[column]) & before.notna()).sum()
-            )
+    if options.trim_whitespace:
+        for column in frame.columns:
+            if pd.api.types.is_object_dtype(frame[column]) or pd.api.types.is_string_dtype(frame[column]):
+                before = frame[column].copy()
+                frame[column] = frame[column].map(
+                    lambda value: value.strip() if isinstance(value, str) else value
+                )
+                trimmed_cells += int(((before != frame[column]) & before.notna()).sum())
 
-    empty_rows = frame.isna().all(axis=1) | frame.fillna("").eq("").all(axis=1)
-    removed_empty_rows = int(empty_rows.sum())
-    frame = frame.loc[~empty_rows].copy()
-    before_deduplication = len(frame)
-    frame = frame.drop_duplicates().reset_index(drop=True)
-    removed_duplicate_rows = before_deduplication - len(frame)
+    blank_values = frame.apply(
+        lambda column: column.map(lambda value: not value.strip() if isinstance(value, str) else pd.isna(value))
+    )
+    empty_rows = blank_values.all(axis=1) if len(frame.columns) else pd.Series(True, index=frame.index)
+    rows_to_remove = pd.Series(False, index=frame.index)
+    removed_empty_rows = int(empty_rows.sum()) if options.remove_empty_rows else 0
+    if options.remove_empty_rows:
+        rows_to_remove |= empty_rows
 
-    normalized = [normalize_column_name(column, index) for index, column in enumerate(frame.columns)]
-    counts: dict[str, int] = {}
-    unique_names = []
-    for name in normalized:
-        counts[name] = counts.get(name, 0) + 1
-        unique_names.append(name if counts[name] == 1 else f"{name}_{counts[name]}")
-    renamed_columns = sum(str(old) != new for old, new in zip(frame.columns, unique_names))
-    frame.columns = unique_names
+    candidate = frame.loc[~rows_to_remove].copy()
+    duplicate_rows = candidate.duplicated(keep="first")
+    removed_duplicate_rows = int(duplicate_rows.sum()) if options.remove_duplicate_rows else 0
+    if options.remove_duplicate_rows:
+        rows_to_remove.loc[candidate.index[duplicate_rows]] = True
+    removed_rows = source.loc[rows_to_remove[rows_to_remove].index].copy()
+    frame = frame.loc[~rows_to_remove].reset_index(drop=True)
+
+    renamed_columns = 0
+    if options.normalize_headers:
+        normalized = [normalize_column_name(column, index) for index, column in enumerate(frame.columns)]
+        counts: dict[str, int] = {}
+        unique_names = []
+        for name in normalized:
+            counts[name] = counts.get(name, 0) + 1
+            unique_names.append(name if counts[name] == 1 else f"{name}_{counts[name]}")
+        renamed_columns = sum(str(old) != new for old, new in zip(frame.columns, unique_names))
+        frame.columns = unique_names
 
     return CleaningResult(
         dataframe=frame,
@@ -70,6 +102,8 @@ def clean_dataframe(dataframe: pd.DataFrame) -> CleaningResult:
         removed_empty_columns=removed_empty_columns,
         trimmed_cells=trimmed_cells,
         renamed_columns=renamed_columns,
+        removed_rows=removed_rows,
+        removed_columns=removed_columns,
     )
 
 
